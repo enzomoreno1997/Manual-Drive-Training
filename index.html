@@ -1,7 +1,351 @@
-Gusto kong gumawa ng isang 2D top-down o side-scrolling driving game na naka-host sa GitHub Pages. HTML5, CSS, at vanilla JavaScript lang ang gagamitin para madaling i-deploy.
-​Ito ang pinaka-espesyal na feature: Gusto ko may Manual Transmission Mechanic. Kailangan may clutch at gear shifting (Neutral, 1st to 5th gear, Reverse). Kapag hindi tumugma ang RPM sa gear o binitiwan nang bigla ang clutch habang mataas ang RPM, dapat mag-stall (mamatay) ang makina o umusad nang pautal-utal (jerking effect).
-​Iba pang requirements:
-​Controls: Keyboard controls (halimbawa: W/S para sa gas/preno, A/D para sa steering o lane change kung top-down, Shift para sa clutch, at 1-5/N/R para sa pagpapalit ng gear). Maglagay din ng on-screen buttons para sa mobile/touch users kung sakali.
-​Dashboard UI: Magpakita ng real-time Speedometer, Tachometer (RPM gauge na may redline warning), current gear indicator, at clutch engagement status.
-​Gameplay / Environment: Simple obstacle dodging (mga sasakyan o lubak sa daan) para maramdaman ang challenge ng pagtimon ng manual car. May score o distance tracker din.
-​Code Structure: Pwede mo bang ibigay sa akin ang kumpletong code sa isang malinis na single-file HTML (kasama na ang CSS at JS sa loob) para madali ko siyang ma-copy paste at i-upload sa GitHub repository ko?
+<!DOCTYPE html>
+<html lang="fil">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Stick Shift Rush</title>
+<style>
+:root{--bg:#12100e;--fg:#f1e9dc;--ac:#ff9f1c;--bt:#2a2420}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;user-select:none;-webkit-user-select:none}
+#wrap{max-width:900px;margin:0 auto;padding:8px}
+canvas{width:100%;display:block;border-radius:10px;background:#000}
+#pad{display:grid;gap:6px;margin-top:8px}
+.row{display:flex;gap:6px}
+button{flex:1;min-width:0;padding:15px 4px;border:0;border-radius:10px;background:var(--bt);color:var(--fg);font:700 15px system-ui;touch-action:none}
+button.on{background:var(--ac);color:#111}
+button:focus-visible{outline:2px solid var(--ac)}
+.help{font-size:12px;line-height:1.5;opacity:.7;text-align:center;margin:8px 4px}
+</style>
+</head>
+<body>
+<div id="wrap">
+<canvas id="c"></canvas>
+<div id="pad">
+ <div class="row">
+  <button data-g="-1">R</button><button data-g="0">N</button><button data-g="1">1</button><button data-g="2">2</button><button data-g="3">3</button><button data-g="4">4</button><button data-g="5">5</button><button data-a="eng">ENGINE</button>
+ </div>
+ <div class="row">
+  <button data-i="left">◀</button><button data-i="right">▶</button><button data-i="clu">CLUTCH</button><button data-i="half">½ CLUTCH</button><button data-i="brk">BRAKE</button><button data-i="gas">GAS</button>
+ </div>
+</div>
+<p class="help">W/S gas/preno · A/D liko · <b>Shift</b> clutch (hawak) · <b>Space</b> half-clutch · 1-5, N, R gear · E start engine · Enter start/restart · M mute</p>
+</div>
+
+<script>
+// ===== Setup =====
+const cv=document.getElementById('c'),g=cv.getContext('2d'),W=800,H=560;
+cv.width=W;cv.height=H;
+const HZ=215, K=(H-HZ)*7, RW=.46*W/(H-HZ);   // horizon, projection, road width factor
+const RT=[3.2,0,3.6,2.2,1.5,1.1,.85];          // gear ratios: index = gear+1 (R,N,1..5)
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+let G, mode='title', best=0;
+
+function reset(){
+  G={x:0,v:0,dist:0,rpm:900,on:true,gear:0,cp:0,e:0,pe:0,thr:0,brk:0,hp:100,
+     passed:0,obs:[],tm:1,shake:0,t:0,msg:null,maxd:0};
+}
+reset();
+const say=(t,c='#ffd166')=>{G.msg={t,c,l:1.8}};
+
+// ===== Input =====
+const keymap={KeyW:'gas',ArrowUp:'gas',KeyS:'brk',ArrowDown:'brk',KeyA:'left',ArrowLeft:'left',
+  KeyD:'right',ArrowRight:'right',ShiftLeft:'clu',ShiftRight:'clu',Space:'half'};
+const inp={};
+addEventListener('keydown',e=>{
+  if(keymap[e.code]){inp[keymap[e.code]]=1;e.preventDefault()}
+  if(e.repeat)return;
+  const m=/^(Digit|Numpad)([1-5])$/.exec(e.code);
+  if(m)shift(+m[2]);
+  else if(e.code==='KeyN')shift(0);
+  else if(e.code==='KeyR')shift(-1);
+  else if(e.code==='KeyE')act('eng');
+  else if(e.code==='Enter')act('start');
+  else if(e.code==='KeyM'){mute=!mute}
+});
+addEventListener('keyup',e=>{if(keymap[e.code])inp[keymap[e.code]]=0});
+addEventListener('blur',()=>{for(const k in inp)inp[k]=0});
+
+document.querySelectorAll('button').forEach(b=>{
+  const d=b.dataset;
+  b.addEventListener('pointerdown',e=>{
+    e.preventDefault();audio();
+    if(d.i){inp[d.i]=1;b.classList.add('on')}
+    else if(d.g!==undefined)shift(+d.g);
+    else if(d.a)act(mode==='play'?d.a:'start');
+  });
+  if(d.i)['pointerup','pointercancel','pointerleave'].forEach(ev=>b.addEventListener(ev,()=>{inp[d.i]=0;b.classList.remove('on')}));
+});
+cv.addEventListener('pointerdown',()=>{audio();if(mode!=='play')act('start')});
+
+function act(a){
+  audio();
+  if(a==='start'){if(mode!=='play'){reset();mode='play';say('Pisilin ang Shift, i-gear 1, dahan-dahang bitawan');}return}
+  if(mode!=='play')return;
+  if(a==='eng'&&!G.on){
+    if(G.cp>.75||G.gear===0){G.on=true;G.rpm=900;say('Umandar na!','#8f8')}
+    else say('Pisilin ang clutch o i-Neutral muna bago i-start','#f95');
+  }
+}
+
+// ===== Gear shifting =====
+function shift(n){
+  if(mode!=='play')return;
+  if(n!==0){
+    const bad=G.cp<.75||(n<0&&G.v>5)||(n>0&&G.v<-5);
+    if(bad){G.gear=0;G.shake=.7;G.hp-=1;say('GRIND! Pisilin muna ang clutch','#f55');return}
+  }
+  G.gear=n;
+}
+
+// ===== Audio (engine sound) =====
+let AC,osc,gn,mute=false;
+function audio(){
+  if(AC)return;
+  try{
+    AC=new(window.AudioContext||window.webkitAudioContext)();
+    osc=AC.createOscillator();osc.type='sawtooth';
+    const lp=AC.createBiquadFilter();lp.type='lowpass';lp.frequency.value=650;
+    gn=AC.createGain();gn.gain.value=0;
+    osc.connect(lp);lp.connect(gn);gn.connect(AC.destination);osc.start();
+  }catch(e){AC=null}
+}
+
+// ===== Game logic =====
+const curve=d=>Math.sin(d/260)*.8+Math.sin(d/97)*.4;
+
+function stall(why){
+  G.on=false;G.rpm=0;G.shake=Math.max(G.shake,.8);
+  say(why||'NAMATAY ANG MAKINA! Clutch + E para i-start','#f55');
+}
+
+function update(dt){
+  G.t+=dt;
+  G.thr+=((inp.gas?1:0)-G.thr)*Math.min(1,dt*8);
+  G.brk=inp.brk?1:0;
+
+  // Clutch pedal: mabilis pumisil, dahan-dahang bumitaw
+  const tgt=inp.clu?1:inp.half?.45:0;
+  const df=tgt-G.cp;
+  G.cp+=Math.sign(df)*Math.min(Math.abs(df),(df>0?7:2.4)*dt);
+  const e=G.gear?clamp((.85-G.cp)/.65,0,1):0;   // 0 = hiwalay, 1 = buong kapit
+  G.e=e;
+  const ratio=RT[G.gear+1];
+
+  // Engine
+  if(G.on){
+    const r=G.rpm;let thr=r>7500?0:G.thr;
+    let d=thr*(8000-r)*2.2-(1-thr)*(r-900)*1.5;
+    if(r<900)d+=(900-r)*8;
+    G.rpm+=d*dt;
+  }
+  // Drivetrain coupling
+  if(e>0){
+    const dir=G.gear>0?1:-1, wr=G.v*dir*ratio*48;   // RPM na hinihingi ng gulong
+    if(G.on){
+      const diff=G.rpm-wr, s=3.5*Math.pow(3.6/ratio,1.6);  // mas mataas ang gear = mas mabigat ang karga
+      const dr=diff*Math.min(.9,s*e*dt);
+      G.rpm-=dr;G.v+=dir*dr*ratio*6e-4;
+      // Jerk: biglang bitaw ng clutch habang malaki ang RPM mismatch
+      const shk=Math.abs(diff)*Math.max(e-G.pe,0)/70;
+      if(shk>.35){G.shake=Math.max(G.shake,Math.min(1,shk));G.v+=(Math.random()-.5)*shk*3;
+        if(shk>.8)say('JERK! Dahan-dahan sa clutch','#ffb347')}
+      // Lugging: masyadong mataas ang gear sa mababang bilis
+      if(e>.3&&G.rpm<1100&&G.gear>0){
+        const lug=(1100-G.rpm)/650;
+        G.v+=Math.sin(G.t*35)*lug*dt*90;G.shake=Math.max(G.shake,lug*.5);
+        say('PAUTAL-UTAL! Mag-downshift','#ffb347');
+      }
+    }else{
+      G.v-=Math.sign(G.v)*Math.min(Math.abs(G.v),8*e*dt);
+    }
+  }
+  if(G.on&&G.rpm<450)stall();
+  if(G.rpm>9500)G.rpm=9500;
+  if(G.on&&G.rpm>8000){G.hp-=dt*8;G.shake=Math.max(G.shake,.3);say('OVER-REV! Mag-upshift!','#f55')}
+  if(!G.on&&e===0)G.rpm=Math.max(0,G.rpm-3000*dt);
+
+  // Drag, preno, off-road
+  let dec=Math.abs(G.v)*.012+(Math.abs(G.v)>.5?1.2:0);
+  if(G.brk)dec+=40;
+  if(Math.abs(G.x)>1.05){dec+=25;G.shake=Math.max(G.shake,.25)}
+  G.v-=Math.sign(G.v)*Math.min(Math.abs(G.v),dec*dt);
+  if(Math.abs(G.v)<.05&&!G.thr&&!e)G.v=0;
+
+  // Galaw
+  G.dist+=G.v/3.6*dt;
+  G.maxd=Math.max(G.maxd,G.dist);
+  G.x+=((inp.right?1:0)-(inp.left?1:0))*dt*1.6*Math.min(1,Math.abs(G.v)/25);
+  G.x-=curve(G.dist)*dt*Math.max(0,G.v)/60*.3;
+  G.x=clamp(G.x,-1.4,1.4);
+
+  // Obstacles
+  G.tm-=dt;
+  if(G.tm<=0&&G.obs.length<14){
+    G.tm=.9+Math.random()*.9;
+    const car=Math.random()<.6;
+    G.obs.push({x:[-.6,0,.6][Math.random()*3|0],z:G.dist+170,car,sp:car?20+Math.random()*30:0,
+      col:`hsl(${Math.random()*360|0},60%,48%)`,hit:0,pass:0});
+  }
+  for(const o of G.obs){
+    o.z+=o.sp/3.6*dt;
+    const dz=o.z-G.dist;
+    if(!o.hit&&dz<13&&dz>7&&Math.abs(o.x-G.x)<.26){
+      o.hit=1;G.shake=1;
+      if(o.car){G.hp-=22;G.v*=.35;say('BANGGAAN!','#f55');if(G.gear&&G.e>.3)stall('BANGGAAN AT NAMATAY ANG MAKINA!')}
+      else{G.hp-=8;G.v*=.75;say('LUBAK!','#ffb347')}
+    }
+    if(!o.pass&&!o.hit&&dz<7){o.pass=1;if(o.car)G.passed++}
+  }
+  G.obs=G.obs.filter(o=>o.z-G.dist>-15);
+
+  G.pe=e;
+  G.shake=Math.max(0,G.shake-dt*2.5);
+  if(G.msg&&(G.msg.l-=dt)<=0)G.msg=null;
+  if(G.hp<=0){G.hp=0;mode='over';best=Math.max(best,score())}
+}
+const score=()=>Math.floor(G.maxd/10)+G.passed*50;
+
+// ===== Rendering =====
+const hwAt=y=>(y-HZ)*RW;
+function cxAt(y){const u=(y-HZ)/(H-HZ);return W/2+curve(G.dist)*W*.5*(1-u)*(1-u)}
+
+function car(x,y,w,col){
+  const h=w*.55;
+  g.fillStyle='rgba(0,0,0,.35)';g.fillRect(x-w*.58,y-h*.12,w*1.16,h*.2);
+  g.fillStyle='#111';g.fillRect(x-w*.5,y-h*.3,w*.16,h*.3);g.fillRect(x+w*.34,y-h*.3,w*.16,h*.3);
+  g.fillStyle=col;g.fillRect(x-w/2,y-h,w,h*.75);
+  g.fillRect(x-w*.36,y-h*1.5,w*.72,h*.6);
+  g.fillStyle='#bcd7e6';g.fillRect(x-w*.3,y-h*1.42,w*.6,h*.4);
+  g.fillStyle='#ff2d2d';g.fillRect(x-w*.47,y-h*.85,w*.2,h*.2);g.fillRect(x+w*.27,y-h*.85,w*.2,h*.2);
+  g.fillStyle='rgba(0,0,0,.35)';g.fillRect(x-w/2,y-h*.4,w,h*.08);
+}
+
+function gauge(x,y,r,val,max,step,lab,red,fmt,alert){
+  g.fillStyle='rgba(10,8,6,.85)';g.beginPath();g.arc(x,y,r,0,7);g.fill();
+  g.lineWidth=3;g.strokeStyle=alert?'#ff3b30':'#4a4038';g.beginPath();g.arc(x,y,r-1,0,7);g.stroke();
+  const A=v=>(.75+1.5*v/max)*Math.PI;
+  if(red<max){g.lineWidth=5;g.strokeStyle='#e63';g.beginPath();g.arc(x,y,r-7,A(red),A(max));g.stroke()}
+  g.lineWidth=2;g.strokeStyle='#cbb';g.fillStyle='#e8dccb';g.font='11px system-ui';g.textAlign='center';g.textBaseline='middle';
+  for(let v=0;v<=max;v+=step){
+    const a=A(v),c=Math.cos(a),s=Math.sin(a);
+    g.beginPath();g.moveTo(x+c*(r-16),y+s*(r-16));g.lineTo(x+c*(r-10),y+s*(r-10));g.stroke();
+    g.fillText(fmt(v),x+c*(r-28),y+s*(r-28));
+  }
+  const a=A(Math.min(val,max));
+  g.lineWidth=3;g.strokeStyle=val>red?'#ff3b30':'#ffb020';
+  g.beginPath();g.moveTo(x,y);g.lineTo(x+Math.cos(a)*(r-14),y+Math.sin(a)*(r-14));g.stroke();
+  g.fillStyle='#ffb020';g.beginPath();g.arc(x,y,5,0,7);g.fill();
+  g.fillStyle='#bba';g.font='bold 11px system-ui';g.fillText(lab,x,y+r*.55);
+}
+
+function render(){
+  g.save();
+  g.translate((Math.random()-.5)*G.shake*14,(Math.random()-.5)*G.shake*10);
+  // Langit
+  const sk=g.createLinearGradient(0,0,0,HZ);sk.addColorStop(0,'#2b2a55');sk.addColorStop(1,'#ff9a5a');
+  g.fillStyle=sk;g.fillRect(-20,-20,W+40,HZ+20);
+  g.fillStyle='#ffd27a';g.beginPath();g.arc(W*.7,HZ-25,38,0,7);g.fill();
+  g.fillStyle='#3a2f4a';g.beginPath();g.moveTo(-20,HZ);
+  for(let x=-20;x<=W+20;x+=20)g.lineTo(x,HZ-22-Math.sin((x+G.dist*.4)/70)*14-Math.sin(x/23)*5);
+  g.lineTo(W+20,HZ);g.fill();
+  // Kalsada
+  for(let y=HZ;y<H;y+=2){
+    const d=K/(y-HZ+.001),st=(((G.dist+d)/9)|0)&1,hw=hwAt(y),c=cxAt(y)-G.x*hw;
+    g.fillStyle=st?'#3b7d3a':'#336f33';g.fillRect(-20,y,W+40,2);
+    g.fillStyle=st?'#d33':'#eee';g.fillRect(c-hw*1.08,y,hw*2.16,2);
+    g.fillStyle=st?'#4b4a4e':'#444348';g.fillRect(c-hw,y,hw*2,2);
+    if(st){g.fillStyle='#e8e0c8';for(const l of[-.3,.3])g.fillRect(c+l*hw-hw*.012,y,hw*.024,2)}
+  }
+  // Obstacles at player car (pinagsunod-sunod: malayo muna)
+  const pY=HZ+K/10, list=G.obs.slice().sort((a,b)=>b.z-a.z);
+  const drawO=o=>{
+    const dz=o.z-G.dist;if(dz<3||dz>170)return;
+    const y=HZ+K/dz,hw=hwAt(y),x=cxAt(y)+(o.x-G.x)*hw;
+    if(o.car)car(x,y,hw*.42,o.col);
+    else{g.fillStyle='#17151a';g.beginPath();g.ellipse(x,y-hw*.02,hw*.17,hw*.06,0,0,7);g.fill();
+      g.strokeStyle='#2c2a30';g.lineWidth=2;g.stroke()}
+  };
+  list.filter(o=>o.z-G.dist>10).forEach(drawO);
+  const steer=(inp.right?1:0)-(inp.left?1:0);
+  car(W/2+steer*5,pY,hwAt(pY)*.42,'#d62828');
+  list.filter(o=>o.z-G.dist<=10).forEach(drawO);
+  g.restore();
+  hud();
+  if(mode!=='play')overlay();
+}
+
+function hud(){
+  const rpm=G.rpm,t=G.t,e=G.e,red=rpm>6500,blink=red&&((t*8)|0)%2;
+  gauge(100,462,88,rpm/1000,8,1,'RPM ×1000',6.5,v=>v,blink);
+  gauge(700,462,88,Math.abs(G.v),200,20,'KM/H',999,v=>v,false);
+  g.textAlign='center';g.textBaseline='middle';
+  g.fillStyle='#f1e9dc';g.font='bold 22px system-ui';g.fillText(Math.round(Math.abs(G.v)),700,432);
+  if(red&&G.on){g.fillStyle=blink?'#ff3b30':'#7a1a14';g.font='bold 13px system-ui';g.fillText('REDLINE',100,432)}
+  // Gear + clutch panel
+  g.fillStyle='rgba(10,8,6,.85)';g.fillRect(W/2-115,6,230,78);
+  g.fillStyle=G.gear===0?'#8ecae6':G.gear<0?'#ff6b6b':'#ffb020';
+  g.font='bold 58px system-ui';g.fillText(G.gear===0?'N':G.gear<0?'R':G.gear,W/2-72,48);
+  g.textAlign='left';g.font='bold 12px system-ui';g.fillStyle='#e8dccb';
+  const cs=G.cp>.75?'CLUTCH: NAKAPISIL':e>.95?'CLUTCH: NAKAKAPIT':G.gear?'CLUTCH: NAGSLI-SLIP':'CLUTCH: LAYA';
+  g.fillText(cs,W/2-30,24);
+  g.fillStyle='#3a322c';g.fillRect(W/2-30,34,135,10);
+  g.fillStyle=G.cp>.75?'#8ecae6':G.cp>.1?'#ffb020':'#6c6';g.fillRect(W/2-30,34,135*G.cp,10);
+  g.fillStyle=G.on?'#7ddc7d':'#ff5d5d';g.fillText(G.on?'ENGINE ON':'ENGINE OFF (E)',W/2-30,66);
+  // Score + HP
+  g.fillStyle='rgba(10,8,6,.85)';g.fillRect(8,6,170,50);
+  g.fillStyle='#f1e9dc';g.font='bold 14px system-ui';
+  g.fillText('Layo: '+Math.max(0,Math.floor(G.maxd))+' m',16,23);
+  g.fillText('Score: '+score(),16,43);
+  g.fillStyle='rgba(10,8,6,.85)';g.fillRect(W-178,6,170,30);
+  g.fillStyle='#3a322c';g.fillRect(W-170,16,154,12);
+  g.fillStyle=G.hp>35?'#6c6':'#e44';g.fillRect(W-170,16,154*G.hp/100,12);
+  // Mensahe
+  if(G.msg&&mode==='play'){
+    g.globalAlpha=clamp(G.msg.l,0,1);g.textAlign='center';g.font='bold 26px system-ui';
+    g.fillStyle='#000';g.fillText(G.msg.t,W/2+2,152);g.fillStyle=G.msg.c;g.fillText(G.msg.t,W/2,150);
+    g.globalAlpha=1;
+  }
+}
+
+function overlay(){
+  g.fillStyle='rgba(8,6,4,.78)';g.fillRect(0,0,W,H);
+  g.textAlign='center';g.fillStyle='#ffb020';
+  if(mode==='title'){
+    g.font='bold 52px system-ui';g.fillText('STICK SHIFT RUSH',W/2,120);
+    g.fillStyle='#f1e9dc';g.font='17px system-ui';
+    ['Manual transmission ang sasakyan mo. Walang awtomatik.','',
+     '1. Hawakan ang Shift (clutch), pindutin ang 1 para sa 1st gear',
+     '2. Pindutin ang W (gas), tapos dahan-dahang bitawan ang Shift',
+     '3. Pag ~5000 RPM na: Shift + 2, bitaw, at ulitin hanggang 5',
+     '4. Iwasan ang mga sasakyan at lubak gamit ang A/D','',
+     'Mataas na gear sa mabagal = mamamatay ang makina',
+     'Biglang bitaw ng clutch = jerk o stall'].forEach((l,i)=>g.fillText(l,W/2,180+i*27));
+  }else{
+    g.font='bold 52px system-ui';g.fillText('GAME OVER',W/2,200);
+    g.fillStyle='#f1e9dc';g.font='22px system-ui';
+    g.fillText('Score: '+score()+'   ·   Best: '+best,W/2,260);
+    g.fillText('Layo: '+Math.floor(G.maxd)+' m   ·   Nalampasan: '+G.passed+' sasakyan',W/2,295);
+  }
+  g.fillStyle='#ffb020';g.font='bold 20px system-ui';
+  g.fillText(mode==='title'?'Enter o i-tap para magsimula':'Enter o i-tap para ulitin',W/2,mode==='title'?450:360);
+}
+
+// ===== Main loop =====
+const gbtns=[...document.querySelectorAll('[data-g]')];
+let last=0;
+function loop(t){
+  const dt=Math.min(.033,(t-last)/1000||0);last=t;
+  if(mode==='play')update(dt);
+  render();
+  gbtns.forEach(b=>b.classList.toggle('on',+b.dataset.g===G.gear));
+  if(AC&&osc){
+    osc.frequency.value=20+G.rpm/60*2;
+    gn.gain.value=(G.on&&!mute&&mode==='play')?.04+.05*G.thr:0;
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
